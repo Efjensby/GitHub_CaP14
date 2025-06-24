@@ -1,0 +1,554 @@
+---
+title: "Github_CaP14"
+format: html
+editor: visual
+---
+
+# Source code for training the CaP14 model and producing main figures
+
+```{r}
+library(pacman)
+
+p_load(tidyverse, dplyr, magrittr, stats, edgeR, glmnet, LCEF, VennDiagram, ggpubr, pROC, clusterProfiler, survival, survminer, forestmodel)
+```
+
+
+# Differential Gene Expression Analysis in cohort 1 
+```{r}
+# Creating design matrix
+design.batch <- model.matrix(~0 + group + Batch, data = raw.dge$samples)
+
+raw.dge <- estimateDisp(raw.dge, design.batch, robust = T)
+
+fit <- glmQLFit(raw.dge, design.batch, robust = T)
+
+#Conduct QL F-tests for groups 
+my.contrasts <- makeContrasts(MPCvsAN = groupMPC-groupAN, 
+                              MPCvsLPC = groupMPC-groupLPC, levels = design.batch)
+
+### Differentially expressed genes between MPC and  AN
+qlf.MPCvsAN <- glmQLFTest(fit, contrast = my.contrasts[,'MPCvsAN'])
+MPCvsAN.genes <- subset(qlf.MPCvsAN$table, p.adjust(PValue, method = 'BH') <= 0.05)
+
+### Differentially expressed genes between MPC and  LPC
+qlf.MPCvsLPC <- glmQLFTest(fit, contrast = my.contrasts[,'MPCvsLPC'])
+MPCvsLPC.genes <- subset(qlf.MPCvsLPC$table, p.adjust(PValue, method = 'BH') <= 0.05)
+```
+
+## Venn Diagrams of DEG
+```{r}
+###### Venn Diagrams ###### 
+Upregulated.MPC.AN <- subset(MPCvsAN.genes, logFC > 0)
+Upregulated.MPC.AN <- rownames(Upregulated.MPC.AN) %>% as.vector
+
+Upregulated.MPC.LPC <- subset(MPCvsLPC.genes, logFC > 0)
+Upregulated.MPC.LPC <- rownames(Upregulated.MPC.LPC) %>% as.vector
+
+VennDiagram_upregulated <- venn.diagram(x = list(Upregulated.MPC.AN, Upregulated.MPC.LPC), 
+                                        category.names = c( 'MPC vs. AN', 'MPC vs. LPC'), 
+                                        output = T, cat.pos = 1, filename = NULL,
+                                        col = c('#D33D3E','#CE2628'), fill = c('#D33D3E','#CE2628'), 
+                                        main = 'Upregulated genes')
+```
+
+
+```{r}
+Downregulated.MPC.AN <- subset(MPCvsAN.genes, logFC < 0)
+Downregulated.MPC.AN <- rownames(Downregulated.MPC.AN) %>% as.vector
+
+Downregulated.MPC.LPC <- subset(MPCvsLPC.genes, logFC < 0)
+Downregulated.MPC.LPC <- rownames(Downregulated.MPC.LPC) %>% as.vector
+
+
+VennDiagram_Downregulated <- venn.diagram(x = list(Downregulated.MPC.AN, Downregulated.MPC.LPC), 
+                                          category.names = c('MPC vs. AN', 'MPC vs. LPC'), 
+                                          output = T, cat.pos = 1, filename = NULL,
+                                          col = c('#6078BA','#4D69B1'), fill = c('#6078BA','#4D69B1'), 
+                                          main = 'Downregulated genes')
+
+```
+
+### Define list of candidate genes
+```{r}
+overlap.up <- intersectR(Upregulated.MPC.AN, Upregulated.MPC.LPC)
+overlap.down <- intersectR(Downregulated.MPC.AN, Downregulated.MPC.LPC)
+
+candidate.genes <- append(overlap.down, overlap.up)
+
+```
+
+```{r}
+# Define candidate df in cohort 1 
+Candidate_df <- cohort1_df[,candidate.genes]
+Candidate_df <- merge(Candidate_df, dplyr::select(MetaData, Type), by = 'row.names')
+
+# Remove genes not mapped in cohorts 2 and 3, and genes where the mean 
+# expression in cohort 2 and/or 3 falls outside ±1.5 SD of cohort 1
+
+# Apply gene filtering
+Candidate_df <- Candidate_df[, filtered.genes]
+
+# Note: filtered.genes contains only genes that are:
+# 1. Present in cohorts 2 and 3
+# 2. Have mean expression in cohorts 2 and 3 within ±1.5 SD of cohort 1 mean of the corresponding gene
+```
+
+
+# Overrepresentation analysis
+```{r}
+# Load pathways 
+pathways.hallmark <- gmtPathways("h.all.v7.5.1.symbols.gmt")
+```
+
+```{r}
+## Convert pathway list into TERM2GENE format
+
+# Convert named list to TERM2GENE data frame
+term2gene <- stack(pathways.hallmark) %>%
+  dplyr::select(term = ind, gene = values)
+
+# Convert term2gene$term to character
+term2gene$term <- as.character(term2gene$term)
+
+
+## Run ORA using clusterProfiler::enricher()
+ora_result <- enricher(gene = candidate.genes,
+                       TERM2GENE = term2gene)
+
+# Convert GeneRatio to numeric
+ora_result@result$GeneRatio_numeric <- sapply(strsplit(ora_result@result$GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2]))
+
+
+# Visualise ORA
+
+ora_result@result %>%
+  dplyr::mutate(
+    log_p = -log10(pvalue),
+    Description = gsub("^HALLMARK_", "", Description)
+  ) %>%
+  dplyr::filter(pvalue < 0.05) %>%
+  ggplot(aes(x = GeneRatio_numeric, y = reorder(Description, GeneRatio_numeric))) +
+  geom_point(aes(size = Count, colour = log_p)) +
+  scale_size_continuous(range = c(3, 6)) +
+  scale_colour_gradientn(
+    colours = c("royalblue", "firebrick3"),
+    name = expression(-log[10](pvalue))
+  ) +
+  labs(
+    x = "Gene ratio (hits / set size)",
+    y = NULL,
+    title = "ORA of DEG – Hallmark Pathways",
+    size = "Gene count"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+```
+
+
+# Training the CaP14 model
+
+```{r}
+# Creating x and y variable in cohort 1 for model training
+y = Candidate_df %>% dplyr::select(Type) %>% as.matrix
+x = Candidate_df %>% dplyr::select(-c(Type)) %>% as.matrix
+
+
+#  Create list of lambda values to try
+lambda_try = 10^seq(-3,5,length.out = 100)
+
+set.seed(1)
+lasso_cv <- cv.glmnet(x, y, alpha = 1, 
+                      lambda = lambda_try, standardize = F, family = 'binomial', nfolds = 3)
+
+plot(lasso_cv) # Inspect binomial deviance for different lambdas
+
+
+lambda <- lasso_cv$lambda.1se # Set lambda value
+
+# Training on cohort 1
+CaP14 <- glmnet(x,y, family= 'binomial', alpha = 1, lambda = lambda, standardize = F)  
+```
+
+## Calculating CaP14 score in cohort 1
+
+```{r}
+pCohort1.risk <- predict(CaP14, s = lambda, newx = x, type = 'response') %>% as.data.frame
+```
+
+## Calculating CaP14 score in cohort 2
+
+```{r}
+# Create x and y matrixes for predictions
+x_cohort2 <- cohort2_df %>% dplyr::select(-c(Type)) %>% as.matrix
+
+# Calculate CaP14 score
+pCohort2.risk <- predict(CaP14, s = lambda, newx = x_cohort2, type = "response") %>% as.data.frame
+```
+
+## Calculating CaP14 score in cohort 3
+
+```{r}
+# Create x and y matrixes for predictions
+x_cohort3 <- cohort3_df %>% dplyr::select(-c(Type)) %>% as.matrix
+
+# Calculate CaP14 score
+pCohort3.risk <- predict(CaP14, s = lambda, newx = as(x_cohort3, "dgCMatrix"), type = 'response') %>% as.data.frame
+```
+
+## Calculating CaP14 score in cohort 4
+
+```{r}
+# Create x and y matrixes for predictions
+x_cohort4 <- cohort4_df %>% dplyr::select(-c(Type)) %>% as.matrix
+
+pCohort4.risk <- predict(CaP14, s = lambda, newx = as(x_cohort4, "dgCMatrix"), type = 'response') %>% as.data.frame
+```
+
+# Determining cutoff based based on Youden's Index in cohort 1
+
+```{r}
+# Calculating the Youden's Index in cohort 1
+cutoff <- coords(roc(pCohort1.risk$Type ~ pCohort1.risk$s1), 'best', best.method = 'youden')
+
+```
+
+## ROC-curve of CaP14 score in cohorts 1 and 2 for predicting MPC
+
+```{r}
+# Calculating the Youden's Index in cohort 2 (This is only used to plot on the ROC-curve)
+cutoff.cohort2 <- coords(roc(pCohort2.risk$Type ~ pCohort2.risk$s1), 'best', best.method = 'youden')
+
+plot.roc(roc(pCohort1.risk$Type ~ pCohort1.risk$s1, direction = '<'), print.auc = T, col = '#213468', lty = 'solid', main = 'MPC vs. LPC', print.thres = cutoff$threshold)
+plot.roc(roc(pCohort2.risk$Type ~ pCohort2.risk$s1, direction = '<'), add = T, print.auc = T, print.auc.y = 0.3, col = '#08529c', lty = 'dashed', print.thres = cutoff.cohort2$threshold)
+legend('bottom', legend = c('Cohort 1', 'Cohort 2'), col = c('#213468', '#08529c'), 
+       lwd = 3, cex = 1, xpd = T, horiz = T, lty = c('solid','dashed'))
+```
+
+## Assigning CaP14 Low/High in cohort 1 based on Youdens Index in cohort 1
+
+```{r}
+for (i in 1:nrow(pCohort1.risk)){
+  pCohort1.risk[i,'risk'] <- ifelse(pCohort1.risk[i,'s1'] < cutoff$threshold, 'Low',  'High')
+}
+```
+
+## Assigning CaP14 Low/High in cohort 2 based on Youdens Index in cohort 1
+
+```{r}
+for (i in 1:nrow(pCohort2.risk)){
+  pCohort2.risk[i,'risk'] <- ifelse(pCohort2.risk[i,'s1'] < cutoff$threshold, 'Low',  'High')
+}
+```
+
+## Assigning CaP14 Low/High in cohort 3 based on Youden's Index in cohort 1
+
+```{r}
+for (i in 1:nrow(pCohort3.risk)){
+  pCohort3.risk[i,'risk'] <- ifelse(pCohort3.risk[i,'s1'] < cutoff$threshold, 'Low', 'High')
+}
+```
+
+## Assigning CaP14 Low/High in cohort 4 based on Youden's Index in cohort 1
+
+```{r}
+for (i in 1:nrow(pCohort4.risk)){
+  pCohort4.risk[i,'risk'] <- ifelse(pCohort4.risk[i,'s1'] < cutoff$threshold, 'Low', 'High')
+}
+```
+
+# Kaplan-Meier Analysis
+
+## Prostate cancer-specific death
+
+### Cohort 1
+
+```{r}
+cox_cohort1_death <- coxph(Surv(as.numeric(time_to_death), death) ~ risk, data = subset(pCohort1.risk, !is.na(death)))
+
+summary_cox_cohort1_death <- summary(cox_cohort1_death)
+
+hr_cohort1_death <- round(summary_cox_cohort1_death$coefficients[,"exp(coef)"], 2)
+
+hr_confint_cohort1_death <- round(summary_cox_cohort1_death$conf.int[, c("lower .95", "upper .95")], 2)
+
+p_value_cox_cohort1_death <- signif(summary_cox_cohort1_death$coefficients[, "Pr(>|z|)"], 3)
+
+annot_text_cox_cohort1_death <- paste0("HR = ", hr_cohort1_death,
+                                       " (95% CI: ", hr_confint_cohort1_death[1], "-", hr_confint_cohort1_death[2], ")\n",
+                                       "Cox p = ", p_value_cox_cohort1_death)
+
+km.cohort1.death <- survfit(Surv(as.numeric(time_to_death), death) ~ risk, data = subset(pCohort1.risk, !is.na(death)))
+
+km_plot_cohort1_death <- ggsurvplot(km.cohort1.death, size = 1,                
+           palette = 
+             c('#228B22', "#E7B800"),
+           pval = TRUE,              
+           pval.method = TRUE, 
+           risk.table = TRUE,       
+           risk.table.col = "strata",
+           xlab = 'Time in months', ylab = 'PC-specific survival probability',
+           legend.labs =
+             c("CaP14 low", "CaP14 high"),
+           risk.table.height = 0.25, 
+           ggtheme = theme_bw())
+
+km_plot_cohort1_death$plot <- km_plot_cohort1_death$plot+
+  annotate("text", x  = max(pCohort1.risk$time_to_death, na.rm = T)* 0.6, 
+           y = 0.25, label = annot_text_cox_cohort1_death, hjust = 0.5, size = 5)
+```
+
+### Cohort 2
+
+```{r}
+cox_cohort2_death <- coxph(Surv(time_to_death, death) ~ risk, data = subset(pCohort2.risk, !is.na(death)))
+
+summary_cox_cohort2_death <- summary(cox_cohort2_death)
+
+hr_cohort2_death <- round(summary_cox_cohort2_death$coefficients[,"exp(coef)"], 2)
+
+hr_confint_cohort2_death <- round(summary_cox_cohort2_death$conf.int[, c("lower .95", "upper .95")], 2)
+
+p_value_cox_cohort2_death <- signif(summary_cox_cohort2_death$coefficients[, "Pr(>|z|)"], 3)
+
+annot_text_cox_cohort2_death <- paste0("HR = ", hr_cohort2_death,
+                                       " (95% CI: ", hr_confint_cohort2_death[1], "-", hr_confint_cohort2_death[2], ")\n",
+                                       "Cox p = ", p_value_cox_cohort2_death)
+
+
+km.cohort2.death <- survfit(Surv(time_to_death, death) ~ risk, data = subset(pCohort2.risk, !is.na(death)))
+
+km_plot_cohort2_death <- ggsurvplot(km.cohort2.death, size = 1,                 
+           palette = 
+             c('#228B22',"#E7B800"),
+           #conf.int = TRUE,          
+           pval = TRUE,       
+           pval.method = TRUE, 
+           risk.table = TRUE,
+           risk.table.col = "strata",
+           xlab = 'Time in months', ylab = 'PC-specific survival probability',
+           legend.labs =
+             c("CaP14 low", "CaP14 high"),
+           risk.table.height = 0.25, 
+           ggtheme = theme_bw())
+
+km_plot_cohort2_death$plot <- km_plot_cohort2_death$plot+
+  annotate("text", x  = max(pCohort2.risk$time_to_death, na.rm = T)* 0.6, 
+           y = 0.20, label = annot_text_cox_cohort2_death, hjust = 0.5, size = 5)
+```
+
+## Biochemical recurrence
+
+### Cohort 2
+
+```{r}
+cox_cohort2_bcr <- coxph(Surv(as.numeric(time_to_bcr), as.numeric(bcr_status)) ~ risk, data = subset(pCohort2.risk, !is.na(bcr_status) & pCohort2.risk$Type == 'LPC'))
+
+summary_cox_cohort2_bcr <- summary(cox_cohort2_bcr)
+
+hr_cohort2_bcr <- round(summary_cox_cohort2_bcr$coefficients[,"exp(coef)"], 2)
+
+hr_confint_cohort2_bcr <- round(summary_cox_cohort2_bcr$conf.int[, c("lower .95", "upper .95")], 2)
+
+p_value_cox_cohort2_bcr <- signif(summary_cox_cohort2_bcr$coefficients[, "Pr(>|z|)"], 3)
+
+annot_text_cox_cohort2_bcr <- paste0("HR = ", hr_cohort2_bcr,
+                                       " (95% CI: ", hr_confint_cohort2_bcr[1], "-", hr_confint_cohort2_bcr[2], ")\n",
+                                       "Cox p = ", p_value_cox_cohort2_bcr)
+
+
+km.cohort2.fit <- survfit(Surv(as.numeric(time_to_bcr), as.numeric(bcr_status)) ~ risk, data = subset(pCohort2.risk, !is.na(bcr_status) & pCohort1.risk$Type == 'LPC'))
+
+
+km_plot_cohort2_bcr <- ggsurvplot(km.cohort2.fit, size = 1,                 
+           palette = 
+             c('#228B22', "#E7B800"),
+           pval = TRUE,              
+           pval.method = TRUE, 
+           risk.table = TRUE,        
+           risk.table.col = "strata",
+           xlab = 'Time in months', ylab = 'BCR-free survival probability',
+           xlim = c(0,150),
+           legend.labs =
+             c("CaP14 low", "CaP14 high"),   
+           risk.table.height = 0.25,
+           ggtheme = theme_bw())
+
+km_plot_cohort2_bcr$plot <- km_plot_cohort2_bcr$plot+
+  annotate("text", x  = max(pCohort2.risk$time_to_bcr, na.rm = T)* 0.6, 
+           y = 0.5, label = annot_text_cox_cohort2_bcr, hjust = 0.7, size = 5)
+```
+
+### Cohort 3
+
+```{r}
+cox_cohort3_bcr <- coxph(Surv(time_to_bcr, bcr_status) ~ risk, data = subset(pCohort3.risk, !is.na(bcr_status)))
+
+summary_cox_cohort3_bcr <- summary(cox_cohort3_bcr)
+
+hr_cohort3_bcr <- round(summary_cox_cohort3_bcr$coefficients[,"exp(coef)"], 2)
+
+hr_confint_cohort3_bcr <- round(summary_cox_cohort3_bcr$conf.int[, c("lower .95", "upper .95")], 2)
+
+p_value_cox_cohort3_bcr <- signif(summary_cox_cohort3_bcr$coefficients[, "Pr(>|z|)"], 3)
+
+annot_text_cox_cohort3_bcr <- paste0("HR = ", hr_cohort3_bcr,
+                                       " (95% CI: ", hr_confint_cohort3_bcr[1], "-", hr_confint_cohort3_bcr[2], ")\n",
+                                       "Cox p = ", p_value_cox_cohort3_bcr)
+
+km.cohort3.fit <- survfit(Surv(time_to_bcr, bcr_status) ~ risk, data = subset(pCohort3.risk, !is.na(bcr_status)))
+
+km_plot_cohort3_bcr <- ggsurvplot(km.cohort3.fit, size = 1,                 
+           palette = 
+             c('#228B22',"#E7B800"),
+           pval = TRUE,     
+           pval.method = TRUE, 
+           risk.table = TRUE,        
+           risk.table.col = "strata",
+           xlab = 'Time in months', ylab = 'BCR-free survival probability',
+           legend.labs =
+             c("CaP14 low", "CaP14 high"),
+           risk.table.height = 0.25, 
+           ggtheme = theme_bw()) 
+
+km_plot_cohort3_bcr$plot <- km_plot_cohort3_bcr$plot+
+  annotate("text", x  = max(pCohort3.risk$time_to_bcr, na.rm = T)* 0.6, 
+           y = 0.20, label = annot_text_cox_cohort3_bcr, hjust = 0.5, size = 5)
+```
+
+### Cohort 4
+
+```{r}
+cox_cohort4_bcr <- coxph(Surv(time_to_bcr, bcr_status) ~ risk, data = subset(pCohort4.risk, !is.na(bcr_status)))
+
+summary_cox_cohort4_bcr <- summary(cox_cohort4_bcr)
+
+hr_cohort4_bcr <- round(summary_cox_cohort4_bcr$coefficients[,"exp(coef)"], 2)
+
+hr_confint_cohort4_bcr <- round(summary_cox_cohort4_bcr$conf.int[, c("lower .95", "upper .95")], 2)
+
+p_value_cox_cohort4_bcr <- signif(summary_cox_cohort4_bcr$coefficients[, "Pr(>|z|)"], 3)
+
+annot_text_cox_cohort4_bcr <- paste0("HR = ", hr_cohort4_bcr,
+                                     " (95% CI: ", hr_confint_cohort4_bcr[1], "-", hr_confint_cohort4_bcr[2], ")\n",
+                                     "Cox p = ", p_value_cox_cohort4_bcr)
+
+
+km.cohort4.fit <- survfit(Surv(time_to_bcr, bcr_status) ~ risk, data = subset(pCohort4.risk, !is.na(bcr_status)))
+
+km_plot_cohort4_bcr <- ggsurvplot(km.cohort4.fit, size = 1,                 
+           palette = 
+             c('#228B22',"#E7B800"),
+           pval = TRUE,    
+           pval.method = TRUE, 
+           risk.table = TRUE,        
+           risk.table.col = "strata",
+           xlab = 'Time in months', ylab = 'BCR-free survival probability',
+           legend.labs =
+             c("CaP14 low", "CaP14 high"),
+           risk.table.height = 0.25, 
+           ggtheme = theme_bw()) 
+
+km_plot_cohort4_bcr$plot <- km_plot_cohort4_bcr$plot+
+  annotate("text", x  = max(pCohort4.risk$time_to_bcr, na.rm = T)* 0.6, 
+           y = 0.20, label = annot_text_cox_cohort4_bcr, hjust = 0.5, size = 5)
+```
+
+# Cox-regression analysis
+
+## Univariate cox-regression
+
+```{r}
+# Creating list of lists for panel layout
+panels <- list(
+  list(width = 0.03), 
+  list(width = 0.1, display = ~variable, fontface = "bold", heading = "Variable", fontfamily = "mono"),
+  list(width = 0.05, display = ~level),
+  list(width = 0.1, display = ~n, hjust = 1, heading = "Patients"),
+  list(width = 0.1, display = ~n_events, hjust = 1, width = 0.1, heading = "Events"),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.3, item = "forest", hjust = 0.5, heading = "Hazard Ratio", linetype = "dashed", line_x  = 0),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.2, display = ~ ifelse(reference, "Reference", sprintf(
+    "%0.2f (%0.2f, %0.2f)",
+    trans(estimate), trans(conf.low), trans(conf.high)
+  )), display_na = NA),
+  list(width = 0.1, display = ~ifelse(reference, "", format.pval(p.value, digits = 3, eps = 0.001)), display_na = NA, hjust = 1, heading = "P-value"),
+  list(width = 0.03)
+)
+```
+
+### Cohort 2
+
+```{r}
+# Create dataframe for forest plot
+cox_regression_cohort2 <- pCohort2.risk %>%
+  mutate(time_to_bcr,
+         bcr_status,
+         CaP14 = risk,
+         Clinical_risk = Preop_risk)
+
+# Creating formula
+univ_formulas_cohort2<- sapply(c("CaP14","Clinical_risk"),function(x)as.formula(paste('Surv(time_to_bcr,bcr_status)~',x)))
+# Creating a list of models
+univ_models_cohort2 <- lapply(univ_formulas_cohort2, function(x){coxph(x,data=cox_regression_cohort2)})
+# Pass the model list to forestmodel
+forest_model(model_list=univ_models_cohort2, merge_models=T, limits = c(log(0.1),log(22)), 
+             panels = panels, recalculate_width = F, factor_separate_line = T)
+```
+
+### Cohort 3
+
+```{r}
+# Create dataframe for forest plot
+cox_regression_cohort3 <- pCohort3.risk %>%
+  mutate(time_to_bcr,
+         bcr_status,
+         CaP14 = risk)
+
+# Creating formula.
+univ_formulas_cohort3 <- sapply(c('CaP14'),function(x)as.formula(paste('Surv(time_to_bcr,bcr_status)~',x)))
+# Creating a list of models
+univ_models_cohort3 <- lapply(univ_formulas_cohort3, function(x){coxph(x,data=cox_regression_cohort3)})
+# Pass the model list to forestmodel
+forest_model(model_list=univ_models_cohort3, merge_models=T, limits = c(log(0.1),log(22)), 
+             panels = panels, recalculate_width = F, factor_separate_line = T)
+```
+
+### Cohort 4
+
+```{r}
+# Create dataframe for forest plot 
+cox_regression_cohort4 <- pCohort4.risk %>%
+  mutate(time_to_bcr,
+         bcr_status,
+         CaP14 = risk,
+         Clinical_risk = Preop_risk)
+
+# Creating formula
+univ_formulas_cohort4 <- sapply(c("CaP14","Clinical_risk"),function(x)as.formula(paste('Surv(time_to_bcr,bcr_status)~',x)))
+# Creating a list of models
+univ_models_cohort4 <- lapply(univ_formulas_cohort4, function(x){coxph(x,data=cox_regression_cohort4)})
+# Pass the model list to forestmodel
+forest_model(model_list=univ_models_cohort4, merge_models=T, limits = c(log(0.1),log(22)), 
+             panels = panels, recalculate_width = F, factor_separate_line = T)
+```
+
+## Multivariate cox-regression
+
+### Cohort 2
+
+```{r}
+forest_model(coxph(Surv(time_to_bcr, bcr_status) ~CaP14+Clinical_risk, cox_regression_cohort2), limits = c(log(0.1),log(22)), 
+             panels = panels, recalculate_width = F, factor_separate_line = T)
+```
+
+### Cohort 4
+
+```{r}
+forest_model(coxph(Surv(time_to_bcr, bcr_status) ~CaP14+Clinical_risk, cox_regression_cohort4), limits = c(log(0.1),log(22)), 
+             panels = panels, recalculate_width = F, factor_separate_line = T)
+```
